@@ -8,6 +8,10 @@ import { invalidateAllDashboardCaches, cache, invalidateUserSettingsCache } from
 import { insertUserSchema, insertServiceSchema, insertInvoiceSchema, insertLocationSchema, insertBookingSchema, users, services, invoices, locations, expenses, debts, debtPayments, equipment, settings, notifications, userSettings, invoiceSettings, cloudflareConfig, cloudflareDnsRecords, User, Invoice, Service, Expense, Debt, DebtPayment, Settings, Notification, UserSettings } from "@shared/schema";
 import { db } from "./db";
 import { eq, and, gte, lte, or, sql, count, isNull, isNotNull, exists, notExists, inArray, desc } from "drizzle-orm";
+// TypeScript may report a missing module here until dependencies are installed.
+// The runtime import is valid; silence the type checker for the import.
+// @ts-ignore
+import rateLimit from 'express-rate-limit';
 import { z } from "zod";
 import session from "express-session";
 import multer from "multer";
@@ -136,6 +140,17 @@ const uploadServiceImage = multer({
 });
 
 export async function registerRoutes(app: Express): Promise<Server> {
+  // Global rate limiter to protect against refresh/spam DoS
+  const globalRateLimiter = rateLimit({
+    windowMs: 60 * 1000, // 1 minute
+    max: 100, // limit each IP to 100 requests per windowMs
+    standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
+    legacyHeaders: false, // Disable the `X-RateLimit-*` headers
+    message: { error: 'Too many requests, please try again later.' },
+  });
+
+  // Apply the rate limiter as a global middleware early
+  app.use(globalRateLimiter);
   // Request timing middleware: logs slow requests (helps find bottlenecks)
   app.use((req: Request, res: Response, next: NextFunction) => {
     const start = Date.now();

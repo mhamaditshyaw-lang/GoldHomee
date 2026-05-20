@@ -431,11 +431,13 @@ export default function Expenses() {
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="all">{t('expenses.allCategories')}</SelectItem>
-                    {Array.from(new Set(expenses.map((expense: Expense) => expense.category))).map((category: unknown) => (
-                      <SelectItem key={category as string} value={category as string}>
-                        {category}
-                      </SelectItem>
-                    ))}
+                    {Array.from(new Set(expenses.map((expense: Expense) => expense.category)))
+                      .map((c) => String(c))
+                      .map((category: string) => (
+                        <SelectItem key={category} value={category}>
+                          {category}
+                        </SelectItem>
+                      ))}
                   </SelectContent>
                 </Select>
               </CardContent>
