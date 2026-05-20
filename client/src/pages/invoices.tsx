@@ -42,7 +42,7 @@ export default function Invoices() {
 
   const [selectedInvoiceForDetails, setSelectedInvoiceForDetails] = useState<InvoiceWithCleaner | null>(null);
   const [currentPage, setCurrentPage] = useState(1);
-  const [itemsPerPage, setItemsPerPage] = useState(10);
+  const [itemsPerPage] = useState(50); // Fixed page size for API
 
   // Close form when language changes
   useEffect(() => {
@@ -98,19 +98,38 @@ export default function Invoices() {
     }
   }, [isPageEnabled, settingsLoading, setLocation, toast, t]);
 
-
-  const { data: invoices, isLoading } = useQuery<InvoiceWithCleaner[]>({
-    queryKey: ["/api/invoices"],
+  // Query with pagination parameters
+  const { data: paginatedData, isLoading } = useQuery<{
+    items: InvoiceWithCleaner[];
+    total: number;
+    page: number;
+    limit: number;
+    pages: number;
+  } | undefined>({
+    queryKey: ["/api/invoices", { page: currentPage, limit: itemsPerPage }],
+    queryFn: async () => {
+      const res = await apiRequest(
+        'GET',
+        `/api/invoices?page=${currentPage}&limit=${itemsPerPage}`
+      );
+      return await res.json();
+    },
     staleTime: 5 * 1000, // 5 seconds
     refetchInterval: false, // Let WebSocket handle updates
     refetchIntervalInBackground: false,
   });
+
+  // Extract items and pagination info
+  const invoices = paginatedData?.items || [];
+  const totalInvoices = paginatedData?.total || 0;
+  const totalPages = paginatedData?.pages || 0;
 
   const deleteMutation = useMutation({
     mutationFn: async (id: number) => {
       return await apiRequest('DELETE', `/api/invoices/${id}`);
     },
     onSuccess: () => {
+      // Invalidate all invoice queries to refresh data
       queryClient.invalidateQueries({ queryKey: ["/api/invoices"] });
       queryClient.invalidateQueries({ queryKey: ["/api/dashboard/stats"] }); // Refresh dashboard
       queryClient.invalidateQueries({ queryKey: ["/api/expenses"] }); // Refresh accounting if expenses are involved
@@ -131,10 +150,11 @@ export default function Invoices() {
   // Reset to page 1 when filters change
   useEffect(() => { setCurrentPage(1); }, [searchTerm, statusFilter, startDate, endDate]);
 
-  const filteredInvoices = invoices?.filter(invoice => {
+  // Client-side filtering applied to the paginated results from the server
+  const filteredInvoices = invoices.filter((invoice: InvoiceWithCleaner) => {
     const matchesSearch =
       invoice.customerName.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      invoice.services.some(service => service.name.toLowerCase().includes(searchTerm.toLowerCase())) ||
+      invoice.services.some((service: any) => service.name.toLowerCase().includes(searchTerm.toLowerCase())) ||
       (invoice.cleaner?.name?.toLowerCase().includes(searchTerm.toLowerCase()) ?? false);
 
     const matchesStatus = statusFilter === "all" || invoice.status === statusFilter;
@@ -149,10 +169,13 @@ export default function Invoices() {
     const matchesEndDate = !endDateOnly || invoiceDateOnly <= endDateOnly;
 
     return matchesSearch && matchesStatus && matchesStartDate && matchesEndDate;
-  }) ?? [];
+  });
 
-  const totalPages = Math.ceil(filteredInvoices.length / itemsPerPage);
-  const paginatedInvoices = filteredInvoices.slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage);
+  // Pagination for filtered results (client-side pagination of already-paginated server results)
+  const clientItemsPerPage = 10;
+  const clientTotalPages = Math.ceil(filteredInvoices.length / clientItemsPerPage);
+  const clientCurrentPage = 1;
+  const paginatedInvoices = filteredInvoices.slice((clientCurrentPage - 1) * clientItemsPerPage, clientCurrentPage * clientItemsPerPage);
 
   const getStatusColor = (status: string) => {
     switch (status) {
@@ -235,7 +258,7 @@ export default function Invoices() {
   const handleExportAll = async () => {
     try {
       // Convert types for PDF export
-      const invoicesForPDF = filteredInvoices.map(invoice => ({
+      const invoicesForPDF = filteredInvoices.map((invoice: InvoiceWithCleaner) => ({
         ...invoice,
         createdAt: invoice.createdAt instanceof Date ? invoice.createdAt.toISOString() : invoice.createdAt,
         notes: invoice.notes ?? undefined,
@@ -414,14 +437,14 @@ export default function Invoices() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {paginatedInvoices.map((invoice) => (
+                  {paginatedInvoices.map((invoice: InvoiceWithCleaner) => (
                     <TableRow key={invoice.id} data-testid={`invoice-row-${invoice.id}`}>
                       <TableCell className="font-medium" data-testid={`customer-name-${invoice.id}`}>
                         {invoice.customerName}
                       </TableCell>
                       <TableCell data-testid={`services-${invoice.id}`}>
                         {Array.isArray(invoice.services) && invoice.services.length > 0
-                          ? invoice.services.map(s => s.name).join(", ")
+                          ? invoice.services.map((s: any) => s.name).join(", ")
                           : t('invoices.multipleServices')
                         }
                       </TableCell>
@@ -480,18 +503,7 @@ export default function Invoices() {
             {filteredInvoices.length > 0 && (
               <div className="flex flex-col sm:flex-row items-center justify-between gap-4 px-2 py-4 border-t">
                 <div className="flex items-center gap-2">
-                  <span className="text-sm text-gray-700 font-medium">Show:</span>
-                  <Select value={itemsPerPage.toString()} onValueChange={(v) => { setItemsPerPage(Number(v)); setCurrentPage(1); }}>
-                    <SelectTrigger className="w-20 h-9"><SelectValue /></SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="5">5</SelectItem>
-                      <SelectItem value="10">10</SelectItem>
-                      <SelectItem value="20">20</SelectItem>
-                      <SelectItem value="50">50</SelectItem>
-                      <SelectItem value="100">100</SelectItem>
-                    </SelectContent>
-                  </Select>
-                  <span className="text-sm text-gray-600">of {filteredInvoices.length} records</span>
+                  <span className="text-sm text-gray-600">Total: {totalInvoices} records | Page {currentPage} of {totalPages}</span>
                 </div>
                 <div className="flex items-center gap-2">
                   <Button variant="outline" size="sm" onClick={() => setCurrentPage(p => Math.max(1, p - 1))} disabled={currentPage === 1} className="h-9">

@@ -145,6 +145,8 @@ export default function DebtManagement() {
   const [paymentNotes, setPaymentNotes] = useState("");
   const [filterStatus, setFilterStatus] = useState("all");
   const [filterPriority, setFilterPriority] = useState("all");
+  const [currentPage, setCurrentPage] = useState(1);
+  const [itemsPerPage] = useState(50); // Fixed page size for API
   const { formatCurrency } = useCurrency();
   const { toast } = useToast();
   const { t } = useLanguage();
@@ -162,9 +164,26 @@ export default function DebtManagement() {
     }
   }, [isPageEnabled, settingsLoading, setLocation, toast, t]);
 
-  const { data: debts = [], isLoading } = useQuery<Debt[]>({
-    queryKey: ["/api/debts"],
+  const { data: paginatedData = { items: [], total: 0, page: 1, limit: 50, pages: 0 }, isLoading } = useQuery<{
+    items: Debt[];
+    total: number;
+    page: number;
+    limit: number;
+    pages: number;
+  }>({
+    queryKey: ["/api/debts", { page: currentPage, limit: itemsPerPage }],
+    queryFn: async () => {
+      const res = await apiRequest(
+        'GET',
+        `/api/debts?page=${currentPage}&limit=${itemsPerPage}`
+      );
+      return await res.json();
+    },
   });
+
+  const debts = paginatedData.items || [];
+  const debtTotal = paginatedData.total || 0;
+  const debtTotalPages = paginatedData.pages || 0;
 
   const form = useForm<DebtFormData>({
     resolver: zodResolver(createDebtSchema(t)),
@@ -206,7 +225,7 @@ export default function DebtManagement() {
 
   const processPaymentMutation = useMutation({
     mutationFn: async ({ debtId, paymentAmount, notes }: { debtId: number; paymentAmount: number; notes?: string }) => {
-      const debt = debts.find(d => d.id === debtId);
+      const debt = debts.find((d: Debt) => d.id === debtId);
       if (!debt) throw new Error("Debt not found");
 
       const currentAmount = parseFloat(debt.amount);
@@ -237,7 +256,7 @@ export default function DebtManagement() {
     onSuccess: (_, variables) => {
       queryClient.invalidateQueries({ queryKey: ["/api/debts"] });
       queryClient.invalidateQueries({ queryKey: ["/api/debts", variables.debtId, "payments"] });
-      const debt = debts.find(d => d.id === variables.debtId);
+      const debt = debts.find((d: Debt) => d.id === variables.debtId);
       const currentAmount = parseFloat(debt?.amount || "0");
       const remainingAmount = currentAmount - variables.paymentAmount;
 
@@ -330,17 +349,17 @@ export default function DebtManagement() {
     }
   };
 
-  const filteredDebts = debts.filter(debt => {
+  const filteredDebts = debts.filter((debt: Debt) => {
     const statusMatch = filterStatus === "all" || debt.status === filterStatus;
     const priorityMatch = filterPriority === "all" || debt.priority === filterPriority;
     return statusMatch && priorityMatch;
   });
 
   const totalDebt = debts
-    .filter(debt => debt.status === "pending")
-    .reduce((sum, debt) => sum + parseFloat(debt.amount), 0);
+    .filter((debt: Debt) => debt.status === "pending")
+    .reduce((sum: number, debt: Debt) => sum + parseFloat(debt.amount), 0);
 
-  const highPriorityDebts = debts.filter(debt => debt.priority === "high" && debt.status === "pending").length;
+  const highPriorityDebts = debts.filter((debt: Debt) => debt.priority === "high" && debt.status === "pending").length;
 
   const getPriorityColor = (priority: string) => {
     switch (priority) {

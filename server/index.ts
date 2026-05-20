@@ -1,4 +1,5 @@
 import express, { type Request, Response, NextFunction } from "express";
+import path from "path";
 import { registerRoutes } from "./routes";
 import { setupVite, serveStatic, log } from "./vite";
 import { db } from "./db";
@@ -6,6 +7,15 @@ import { users } from "@shared/schema";
 import { eq } from "drizzle-orm";
 import bcrypt from "bcrypt";
 import "./types"; // Import type definitions
+import { setupAuth } from "./auth";
+import {
+  securityMonitor,
+  ipBlockingMiddleware,
+  rateLimitMiddleware,
+  inputValidationMiddleware,
+  securityHeadersMiddleware,
+  sessionSecurityMiddleware
+} from "./security-monitor";
 
 const app = express();
 app.use(express.json());
@@ -103,6 +113,23 @@ app.use((req, res, next) => {
 });
 
 (async () => {
+  // 1. Global Security Headers (Standard express middlewares)
+  app.use(securityHeadersMiddleware);
+  
+  // 2. IP Blocking and Rate Limiting
+  app.use(ipBlockingMiddleware);
+  app.use(rateLimitMiddleware);
+  
+  // 3. Input Validation
+  app.use(inputValidationMiddleware);
+
+  // 4. Initialize Passport & Sessions (This now includes express-session)
+  setupAuth(app);
+  
+  // 5. Session Security (After session is initialized)
+  app.use(sessionSecurityMiddleware);
+
+  // 6. Register API Routes
   const server = await registerRoutes(app);
 
   // Initialize database with default admin user if needed
@@ -116,20 +143,6 @@ app.use((req, res, next) => {
     throw err;
   });
 
-  // Add user authentication middleware
-  app.use(async (req, res, next) => {
-    if (req.session?.userId) {
-      try {
-        const [user] = await db.select().from(users).where(eq(users.id, req.session.userId)).limit(1);
-        if (user) {
-          req.user = user;
-        }
-      } catch (error) {
-        console.error("Error fetching user:", error);
-      }
-    }
-    next();
-  });
 
   // importantly only setup vite in development and after
   // setting up all the other routes so the catch-all route
@@ -138,6 +151,8 @@ app.use((req, res, next) => {
     await setupVite(app, server);
   } else {
     serveStatic(app);
+    // Serve uploads directory in production
+    app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
   }
 
   // Use port from environment or default to 3000

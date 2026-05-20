@@ -8,7 +8,7 @@ module.exports = {
       watch: false,
       env: {
         NODE_ENV: 'production',
-        PORT: 3000,
+        PORT: 5030,
         DATABASE_URL: 'postgresql://hama:1c92AMVkvM91Ku@localhost:5432/altwn',
         SESSION_SECRET: 'bS6T09EEjFy1Ep3OiY4Ua26D9ihXFhkc',
         SESSION_COOKIE_SECURE: 'false'

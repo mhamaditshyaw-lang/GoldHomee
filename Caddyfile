@@ -5,20 +5,7 @@ malialtwni.com {
     # Enable Gzip and Zstd compression for faster downloads
     encode zstd gzip
 
-    # Serve static files directly from Caddy for better performance
-    handle_path /assets/* {
-        root * ./dist/public/assets
-        file_server
-    }
-    
-    # Serve uploaded images directly
-    handle_path /uploads/* {
-        root * ./uploads
-        file_server
-    }
-
-    # Proxy everything else to the Node.js application
-    handle {
-        reverse_proxy localhost:3000
-    }
+    # Proxy everything to the Node.js application
+    # The application will handle serving static files from the dist/public and uploads directories
+    reverse_proxy localhost:5030
 }

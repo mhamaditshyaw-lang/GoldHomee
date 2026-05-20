@@ -45,6 +45,8 @@ export default function Expenses() {
   const [showExpenseDialog, setShowExpenseDialog] = useState(false);
   const [editingExpense, setEditingExpense] = useState<Expense | null>(null);
   const [categoryFilter, setCategoryFilter] = useState<string>("all");
+  const [currentPage, setCurrentPage] = useState(1);
+  const [itemsPerPage] = useState(50); // Fixed page size for API
   const { toast } = useToast();
   const queryClient = useQueryClient();
   const { formatCurrency } = useCurrency();
@@ -81,11 +83,29 @@ export default function Expenses() {
     },
   });
 
-  const { data: expenses = [], isLoading: expensesLoading } = useQuery<Expense[]>({
-    queryKey: ["/api/expenses"],
+  // Query with pagination parameters
+  const { data: paginatedData = { items: [], total: 0, page: 1, limit: 50, pages: 0 }, isLoading: expensesLoading } = useQuery<{
+    items: Expense[];
+    total: number;
+    page: number;
+    limit: number;
+    pages: number;
+  }>({
+    queryKey: ["/api/expenses", { page: currentPage, limit: itemsPerPage }],
+    queryFn: async () => {
+      const res = await apiRequest(
+        'GET',
+        `/api/expenses?page=${currentPage}&limit=${itemsPerPage}`
+      );
+      return await res.json();
+    },
     staleTime: 5 * 60 * 1000,
     refetchInterval: false,
   });
+
+  const expenses = paginatedData.items || [];
+  const expenseTotal = paginatedData.total || 0;
+  const expenseTotalPages = paginatedData.pages || 0;
 
   const addExpenseMutation = useMutation({
     mutationFn: async (data: ExpenseFormData) => {
@@ -191,13 +211,13 @@ export default function Expenses() {
     setShowExpenseDialog(true);
   };
 
-  const filteredExpenses = expenses.filter(expense => 
+  const filteredExpenses = expenses.filter((expense: Expense) => 
     categoryFilter === "all" || expense.category === categoryFilter
   );
 
-  const totalExpenses = filteredExpenses.reduce((sum, expense) => sum + parseFloat(expense.amount), 0);
+  const filteredTotalExpenses = filteredExpenses.reduce((sum: number, expense: Expense) => sum + parseFloat(expense.amount), 0);
 
-  const expensesByCategory = filteredExpenses.reduce((acc, expense) => {
+  const expensesByCategory = filteredExpenses.reduce((acc: Record<string, number>, expense: Expense) => {
     if (!acc[expense.category]) {
       acc[expense.category] = 0;
     }
@@ -344,7 +364,7 @@ export default function Expenses() {
                       {t('expenses.totalExpenses')}
                     </dt>
                     <dd className="text-lg font-medium text-gray-900">
-                      {formatCurrency(totalExpenses)}
+                      {formatCurrency(filteredTotalExpenses)}
                     </dd>
                   </dl>
                 </div>
@@ -384,7 +404,7 @@ export default function Expenses() {
                       {t('expenses.thisMonth')}
                     </dt>
                     <dd className="text-lg font-medium text-gray-900">
-                      {filteredExpenses.filter(expense => 
+                      {filteredExpenses.filter((expense: Expense) => 
                         new Date(expense.date).getMonth() === new Date().getMonth()
                       ).length} {t('expenses.expenses')}
                     </dd>
@@ -411,8 +431,8 @@ export default function Expenses() {
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="all">{t('expenses.allCategories')}</SelectItem>
-                    {Array.from(new Set(expenses.map(expense => expense.category))).map((category) => (
-                      <SelectItem key={category} value={category}>
+                    {Array.from(new Set(expenses.map((expense: Expense) => expense.category))).map((category: unknown) => (
+                      <SelectItem key={category as string} value={category as string}>
                         {category}
                       </SelectItem>
                     ))}
@@ -428,7 +448,7 @@ export default function Expenses() {
               </CardHeader>
               <CardContent>
                 <div className="space-y-3">
-                  {Object.entries(expensesByCategory).map(([category, amount]) => (
+                  {Object.entries(expensesByCategory).map(([category, amount]: [string, number]) => (
                     <div key={category} className="flex justify-between items-center">
                       <span className="text-sm font-medium">{category}</span>
                       <Badge variant="secondary" className="text-red-600">
@@ -477,7 +497,7 @@ export default function Expenses() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {filteredExpenses.map((expense) => (
+                  {filteredExpenses.map((expense: Expense) => (
                     <TableRow key={expense.id}>
                       <TableCell>{format(new Date(expense.date), "MMM d, yyyy")}</TableCell>
                       <TableCell className="font-medium">{expense.description}</TableCell>

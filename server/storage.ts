@@ -10,7 +10,7 @@ import {
   bookings, type CustomerBooking, type InsertBooking
 } from "@shared/schema";
 import { db } from "./db";
-import { eq, desc, and, gte, lte, inArray, sql } from "drizzle-orm";
+import { eq, desc, and, gte, lte, inArray, sql, count, sum } from "drizzle-orm";
 
 // Add query result caching for frequently accessed data
 const queryCache = new Map();
@@ -49,6 +49,7 @@ export interface IStorage {
   createInvoice(invoice: InsertInvoice): Promise<Invoice>;
   getInvoices(): Promise<Invoice[]>;
   getInvoicesByUser(userId: number): Promise<Invoice[]>;
+  getInvoicesPaginated(page: number, limit: number, userId?: number): Promise<{ items: Invoice[], total: number, page: number, limit: number }>;
   getInvoice(id: number): Promise<Invoice | undefined>;
   updateInvoice(id: number, updates: Partial<Invoice>): Promise<Invoice | undefined>;
   deleteInvoice(id: number): Promise<void>;
@@ -87,6 +88,7 @@ export interface IStorage {
   getExpensesByUser(userId: number): Promise<Expense[]>;
   getExpenses(): Promise<Expense[]>;
   getAllExpenses(): Promise<Expense[]>;
+  getExpensesPaginated(page: number, limit: number, userId?: number): Promise<{ items: Expense[], total: number, page: number, limit: number }>;
   updateExpense(id: number, updates: Partial<Expense>): Promise<Expense | undefined>;
   deleteExpense(id: number): Promise<void>;
 
@@ -96,6 +98,7 @@ export interface IStorage {
   getDebtsByUser(userId: number): Promise<Debt[]>;
   getDebts(): Promise<Debt[]>;
   getAllDebts(): Promise<Debt[]>;
+  getDebtsPaginated(page: number, limit: number, userId?: number): Promise<{ items: Debt[], total: number, page: number, limit: number }>;
   updateDebt(id: number, updates: Partial<Debt>): Promise<Debt | undefined>;
   deleteDebt(id: number): Promise<void>;
 
@@ -139,6 +142,14 @@ export interface IStorage {
   getBookingsByUser(userId: number): Promise<CustomerBooking[]>;
   updateBooking(id: number, updates: Partial<CustomerBooking>): Promise<CustomerBooking | undefined>;
   deleteBooking(id: number): Promise<void>;
+
+  // Dashboard aggregations (using SQL for efficiency)
+  getDashboardInvoiceStats(userId?: number): Promise<{ totalRevenue: number, completedJobs: number, totalCount: number }>;
+  getDashboardExpenseStats(userId?: number): Promise<{ totalExpenses: number }>;
+  getDashboardDebtStats(userId?: number): Promise<{ totalDebt: number, pendingCount: number }>;
+  getActiveCleanersCount(): Promise<number>;
+  getActiveLocationsCount(): Promise<number>;
+  getLast7DaysPerformance(userId?: number): Promise<Array<{ day: string; date: string; revenue: number; jobs: number }>>;
 }
 
 export class DatabaseStorage implements IStorage {
@@ -323,6 +334,41 @@ export class DatabaseStorage implements IStorage {
     } catch (error) {
       console.error('Error fetching user invoices:', error);
       return [];
+    }
+  }
+
+  async getInvoicesPaginated(page: number, limit: number, userId?: number): Promise<{ items: Invoice[], total: number, page: number, limit: number }> {
+    try {
+      const offset = (page - 1) * limit;
+
+      // Build the base query
+      let countQuery = db.select({ count: count() }).from(invoices);
+      let itemsQuery = db.select().from(invoices);
+
+      // Apply user filter if provided
+      if (userId) {
+        countQuery = countQuery.where(eq(invoices.cleanerId, userId)) as any;
+        itemsQuery = itemsQuery.where(eq(invoices.cleanerId, userId)) as any;
+      }
+
+      // Get total count
+      const [{ count: total }] = await (countQuery as any);
+
+      // Get paginated items
+      const items = await itemsQuery
+        .orderBy(desc(invoices.createdAt))
+        .limit(limit)
+        .offset(offset);
+
+      return {
+        items: items || [],
+        total,
+        page,
+        limit
+      };
+    } catch (error) {
+      console.error('Error fetching paginated invoices:', error);
+      return { items: [], total: 0, page, limit };
     }
   }
 
@@ -604,6 +650,41 @@ export class DatabaseStorage implements IStorage {
     return this.getExpenses();
   }
 
+  async getExpensesPaginated(page: number, limit: number, userId?: number): Promise<{ items: Expense[], total: number, page: number, limit: number }> {
+    try {
+      const offset = (page - 1) * limit;
+
+      // Build the base query
+      let countQuery = db.select({ count: count() }).from(expenses);
+      let itemsQuery = db.select().from(expenses);
+
+      // Apply user filter if provided
+      if (userId) {
+        countQuery = countQuery.where(eq(expenses.userId, userId)) as any;
+        itemsQuery = itemsQuery.where(eq(expenses.userId, userId)) as any;
+      }
+
+      // Get total count
+      const [{ count: total }] = await (countQuery as any);
+
+      // Get paginated items
+      const items = await itemsQuery
+        .orderBy(desc(expenses.date))
+        .limit(limit)
+        .offset(offset);
+
+      return {
+        items: items || [],
+        total,
+        page,
+        limit
+      };
+    } catch (error) {
+      console.error('Error fetching paginated expenses:', error);
+      return { items: [], total: 0, page, limit };
+    }
+  }
+
   async updateExpense(id: number, updates: Partial<Expense>): Promise<Expense | undefined> {
     try {
       const [updatedExpense] = await db
@@ -668,6 +749,41 @@ export class DatabaseStorage implements IStorage {
 
   async getAllDebts(): Promise<Debt[]> {
     return this.getDebts();
+  }
+
+  async getDebtsPaginated(page: number, limit: number, userId?: number): Promise<{ items: Debt[], total: number, page: number, limit: number }> {
+    try {
+      const offset = (page - 1) * limit;
+
+      // Build the base query
+      let countQuery = db.select({ count: count() }).from(debts);
+      let itemsQuery = db.select().from(debts);
+
+      // Apply user filter if provided
+      if (userId) {
+        countQuery = countQuery.where(eq(debts.userId, userId)) as any;
+        itemsQuery = itemsQuery.where(eq(debts.userId, userId)) as any;
+      }
+
+      // Get total count
+      const [{ count: total }] = await (countQuery as any);
+
+      // Get paginated items
+      const items = await itemsQuery
+        .orderBy(desc(debts.dueDate))
+        .limit(limit)
+        .offset(offset);
+
+      return {
+        items: items || [],
+        total,
+        page,
+        limit
+      };
+    } catch (error) {
+      console.error('Error fetching paginated debts:', error);
+      return { items: [], total: 0, page, limit };
+    }
   }
 
   async updateDebt(id: number, updates: Partial<Debt>): Promise<Debt | undefined> {
@@ -1090,6 +1206,169 @@ export class DatabaseStorage implements IStorage {
     } catch (error) {
       console.error('Error deleting booking:', error);
       throw error;
+    }
+  }
+
+  // Dashboard aggregation methods using SQL for efficiency
+  async getDashboardInvoiceStats(userId?: number): Promise<{ totalRevenue: number, completedJobs: number, totalCount: number }> {
+    try {
+      let query = db.select({
+        totalRevenue: sql<number>`CAST(COALESCE(SUM(CAST(${invoices.totalAmount} AS FLOAT)), 0) AS INT)`,
+        completedJobs: sql<number>`COUNT(CASE WHEN ${invoices.status} = 'completed' THEN 1 END)`,
+        totalCount: count()
+      }).from(invoices);
+
+      if (userId) {
+        query = query.where(eq(invoices.cleanerId, userId)) as any;
+      }
+
+      const [result] = await (query as any);
+      return {
+        totalRevenue: result?.totalRevenue || 0,
+        completedJobs: result?.completedJobs || 0,
+        totalCount: result?.totalCount || 0
+      };
+    } catch (error) {
+      console.error('Error fetching dashboard invoice stats:', error);
+      return { totalRevenue: 0, completedJobs: 0, totalCount: 0 };
+    }
+  }
+
+  async getDashboardExpenseStats(userId?: number): Promise<{ totalExpenses: number }> {
+    try {
+      let query = db.select({
+        totalExpenses: sql<number>`CAST(COALESCE(SUM(CAST(${expenses.amount} AS FLOAT)), 0) AS INT)`
+      }).from(expenses);
+
+      if (userId) {
+        query = query.where(eq(expenses.userId, userId)) as any;
+      }
+
+      const [result] = await (query as any);
+      return {
+        totalExpenses: result?.totalExpenses || 0
+      };
+    } catch (error) {
+      console.error('Error fetching dashboard expense stats:', error);
+      return { totalExpenses: 0 };
+    }
+  }
+
+  async getDashboardDebtStats(userId?: number): Promise<{ totalDebt: number, pendingCount: number }> {
+    try {
+      let query = db.select({
+        totalDebt: sql<number>`CAST(COALESCE(SUM(CAST(${debts.amount} AS FLOAT)), 0) AS INT)`,
+        pendingCount: sql<number>`COUNT(CASE WHEN ${debts.status} = 'pending' THEN 1 END)`
+      }).from(debts);
+
+      if (userId) {
+        query = query.where(eq(debts.userId, userId)) as any;
+      }
+
+      const [result] = await (query as any);
+      return {
+        totalDebt: result?.totalDebt || 0,
+        pendingCount: result?.pendingCount || 0
+      };
+    } catch (error) {
+      console.error('Error fetching dashboard debt stats:', error);
+      return { totalDebt: 0, pendingCount: 0 };
+    }
+  }
+
+  async getActiveCleanersCount(): Promise<number> {
+    try {
+      const [result] = await db.select({ count: count() })
+        .from(users)
+        .where(and(eq(users.role, 'cleaner'), eq(users.isActive, true))) as any;
+      return result?.count || 0;
+    } catch (error) {
+      console.error('Error fetching active cleaners count:', error);
+      return 0;
+    }
+  }
+
+  async getActiveLocationsCount(): Promise<number> {
+    try {
+      const [result] = await db.select({ count: count() })
+        .from(locations)
+        .where(eq(locations.isWorking, true)) as any;
+      return result?.count || 0;
+    } catch (error) {
+      console.error('Error fetching active locations count:', error);
+      return 0;
+    }
+  }
+
+  async getLast7DaysPerformance(userId?: number): Promise<Array<{ day: string; date: string; revenue: number; jobs: number }>> {
+    try {
+      // Get last 7 days of data using SQL GROUP BY
+      // Calculate date range: today minus 6 days to today
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      
+      const sevenDaysAgo = new Date(today);
+      sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 6);
+
+      // Build conditions array
+      const conditions = [
+        gte(invoices.createdAt, sevenDaysAgo),
+        lte(invoices.createdAt, today)
+      ];
+
+      // Add user filter if specified
+      if (userId) {
+        conditions.push(eq(invoices.cleanerId, userId));
+      }
+
+      // Execute GROUP BY query
+      const results = await db.select({
+        date: sql<string>`DATE(${invoices.createdAt})`,
+        dailyRevenue: sql<number>`CAST(COALESCE(SUM(CAST(${invoices.totalAmount} AS FLOAT)), 0) AS INT)`,
+        dailyJobs: count()
+      })
+        .from(invoices)
+        .where(and(...conditions))
+        .groupBy(sql`DATE(${invoices.createdAt})`);
+
+      // Format results with day names
+      const performanceData = results.map((row: any) => {
+        const dateObj = new Date(row.date);
+        const dayName = dateObj.toLocaleDateString('en-US', { weekday: 'short' });
+        
+        return {
+          day: dayName,
+          date: row.date,
+          revenue: row.dailyRevenue,
+          jobs: row.dailyJobs
+        };
+      });
+
+      // Ensure 7 days are present (fill in missing days with zeros)
+      const fullWeek = [];
+      for (let i = 6; i >= 0; i--) {
+        const checkDate = new Date(today);
+        checkDate.setDate(checkDate.getDate() - i);
+        const dateStr = checkDate.toISOString().split('T')[0];
+        
+        const existing = performanceData.find((p: any) => p.date === dateStr);
+        if (existing) {
+          fullWeek.push(existing);
+        } else {
+          const dayName = checkDate.toLocaleDateString('en-US', { weekday: 'short' });
+          fullWeek.push({
+            day: dayName,
+            date: dateStr,
+            revenue: 0,
+            jobs: 0
+          });
+        }
+      }
+
+      return fullWeek;
+    } catch (error) {
+      console.error('Error fetching last 7 days performance:', error);
+      return [];
     }
   }
 }

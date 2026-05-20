@@ -15,6 +15,7 @@ import path from "path";
 import fs from "fs";
 import twilio from "twilio";
 import bcrypt from 'bcrypt';
+import passport from "passport";
 import {
   securityMonitor,
   ipBlockingMiddleware,
@@ -35,37 +36,21 @@ process.on('uncaughtException', (error) => {
 
 // Authentication middleware
 const requireAuth = (req: Request, res: Response, next: NextFunction) => {
-  if (!req.session?.user) {
+  if (!req.isAuthenticated()) {
     return res.status(401).json({ error: "Authentication required" });
   }
   next();
 };
 
-// Extend the Request interface to include session user
-declare module 'express-session' {
-  interface SessionData {
-    userId?: number;
-    user?: {
-      id: number;
-      username: string;
-      name: string;
-      role: string;
-      location?: string | null;
-      latitude?: number | null;
-      longitude?: number | null;
-    };
-    clientIP?: string;
-  }
-}
 
 
 
 // Admin-only middleware
 const requireAdmin = (req: Request, res: Response, next: NextFunction) => {
-  if (!req.session?.userId) {
+  if (!req.isAuthenticated()) {
     return res.status(401).json({ message: "Authentication required" });
   }
-  if (!req.session.user || req.session.user.role !== 'admin') {
+  if (req.user?.role !== 'admin') {
     return res.status(403).json({ message: "Admin access required" });
   }
   next();
@@ -74,13 +59,13 @@ const requireAdmin = (req: Request, res: Response, next: NextFunction) => {
 // Permission check middleware factory
 const requirePermission = (permissionKey: string) => {
   return async (req: Request, res: Response, next: NextFunction) => {
-    if (!req.session?.userId) {
+    if (!req.isAuthenticated()) {
       return res.status(401).json({ message: "Authentication required" });
     }
 
     try {
       // Check if user has this permission
-      const userSetting = await storage.getUserSetting(req.session.userId, permissionKey);
+      const userSetting = await storage.getUserSetting(req.user!.id, permissionKey);
 
       // If no specific setting, check default permission based on role
       if (!userSetting) {
@@ -96,7 +81,7 @@ const requirePermission = (permissionKey: string) => {
           'admin_settings': { admin: true, supervisor: false, cleaner: false },
         };
 
-        const userRole = req.session.user?.role || 'cleaner';
+        const userRole = req.user?.role || 'cleaner';
         const hasPermission = defaultPermissions[permissionKey]?.[userRole] ?? false;
 
         if (!hasPermission) {
@@ -162,64 +147,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
     });
     next();
   });
-  // Setup session middleware
-  let sessionStore: any;
-
-  if (process.env.NODE_ENV === 'production') {
-    // Use PostgreSQL session store in production
-    const ConnectPgSimple = await import('connect-pg-simple');
-    const PgSession = ConnectPgSimple.default(session);
-    const { pool } = await import('./db');
-
-    sessionStore = new PgSession({
-      pool,
-      tableName: 'user_sessions',
-      createTableIfMissing: true,
-    });
-  } else {
-    // Use in-memory session store in development for reliability
-    const MemoryStore = await import('memorystore');
-    const Store = MemoryStore.default(session);
-    sessionStore = new Store({
-      checkPeriod: 86400000, // prune expired entries every 24h
-    });
-  }
-
-  // Test data routes removed
-
-  // Apply security middleware
-  app.use(securityHeadersMiddleware);
-  app.use(ipBlockingMiddleware);
-  app.use(rateLimitMiddleware);
-  app.use(inputValidationMiddleware);
-
-  app.use(session({
-    store: sessionStore,
-    secret: process.env.SESSION_SECRET || 'your-secret-key-change-in-production',
-    resave: false,
-    saveUninitialized: false,
-    rolling: true, // Reset expiration on activity
-    cookie: {
-      secure: process.env.NODE_ENV === 'production',
-      httpOnly: true,
-      maxAge: 24 * 60 * 60 * 1000, // Reduced to 24 hours for better memory management
-      sameSite: 'strict'
-    },
-    // Add performance optimizations
-    name: 'sessionId', // Custom session name
-    proxy: true // Trust proxy for better performance
-  }));
-
-  app.use(sessionSecurityMiddleware);
-
   // Serve uploaded images
   app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
 
   // Image upload endpoint
   app.post("/api/upload/service-image", requireAuth, uploadServiceImage.single('image'), async (req, res) => {
     try {
-      const userRole = req.session.user!.role;
-      const userName = req.session.user!.name;
+      const userRole = req.user!.role;
+      const userName = req.user!.name;
 
       // Only supervisors and admin can upload service images
       if (userRole !== "supervisor" && userRole !== "admin") {
@@ -311,171 +246,49 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // Authentication routes
-  app.post("/api/auth/login", async (req, res) => {
-    const clientIP = req.ip || req.connection.remoteAddress || 'unknown';
-    const userAgent = req.get('User-Agent') || 'unknown';
-
-    try {
-      // Trim username/password to avoid login failures due to whitespace
-      const { username: rawUsername, password: rawPassword } = req.body;
-      const username = typeof rawUsername === 'string' ? rawUsername.trim() : rawUsername;
-      const password = typeof rawPassword === 'string' ? rawPassword.trim() : rawPassword;
-      console.log('Login attempt for username:', username);
-
-      if (!username || !password) {
-        securityMonitor.logSecurityEvent({
-          type: 'login_attempt',
-          ip: clientIP,
-          userAgent,
-          details: { username, reason: 'Missing credentials' },
-          severity: 'low',
-        });
-        return res.status(400).json({ message: "Username and password required" });
+  // Authentication route
+  app.post("/api/auth/login", (req, res, next) => {
+    passport.authenticate("local", (err: any, user: any, info: any) => {
+      if (err) {
+        return next(err);
       }
-
-      // Fallback: Create admin user if database is empty (happens when DB wakes up)
-      try {
-        const allUsers = await storage.getAllUsers();
-        if (allUsers.length === 0 && username === 'admin') {
-          console.log('Database is empty. Creating default admin user...');
-          const hashedPassword = await bcrypt.hash('admin123', 10);
-          await storage.createUser({
-            username: 'admin',
-            password: hashedPassword,
-            name: 'Admin User',
-            role: 'admin',
-            isActive: true,
-          });
-          console.log('Default admin user created. Please retry login.');
-        }
-      } catch (initError) {
-        console.log('Could not check/create admin user:', initError);
-      }
-
-      const user = await storage.getUserByUsername(username);
-      console.log('User found:', user ? 'Yes' : 'No');
-      if (user) {
-        console.log('Stored password (first 10 chars):', user.password.substring(0, 10));
-        console.log('Provided password:', password);
-        console.log('Password match:', user.password === password);
-      }
-
       if (!user) {
-        securityMonitor.logSecurityEvent({
-          type: 'failed_login',
-          ip: clientIP,
-          userAgent,
-          details: { username, reason: 'User not found' },
-          severity: 'medium',
-        });
-        return res.status(401).json({ message: "Invalid credentials" });
+        return res.status(401).json({ message: info?.message || "Invalid credentials" });
       }
-
-      // Compare password - support both plain text and bcrypt
-      let passwordMatch = false;
-
-      // Check if password is bcrypt hashed (starts with $2)
-      if (user.password.startsWith('$2')) {
-        passwordMatch = await bcrypt.compare(password, user.password);
-      } else {
-        // Plain text comparison
-        passwordMatch = user.password === password;
-      }
-
-      if (!passwordMatch) {
-        securityMonitor.logSecurityEvent({
-          type: 'failed_login',
-          ip: clientIP,
-          userAgent,
-          details: { username, reason: 'Invalid password' },
-          severity: 'medium',
-        });
-        return res.status(401).json({ message: "Invalid credentials" });
-      }
-
-      // Check if user account is active
-      if (!user.isActive) {
-        securityMonitor.logSecurityEvent({
-          type: 'failed_login',
-          userId: user.id,
-          ip: clientIP,
-          userAgent,
-          details: { username, reason: 'Account inactive' },
-          severity: 'medium',
-        });
-        return res.status(401).json({ message: "Account is inactive" });
-      }
-
-      // Create session
-      req.session.userId = user.id;
-      req.session.user = {
-        id: user.id,
-        username: user.username,
-        name: user.name,
-        role: user.role
-      };
-      req.session.clientIP = clientIP;
-
-      const userResponse = { ...user };
-      delete (userResponse as any).password;
-
-      securityMonitor.logSecurityEvent({
-        type: 'login_attempt',
-        userId: user.id,
-        ip: clientIP,
-        userAgent,
-        details: { username, success: true },
-        severity: 'low',
-      });
-
-      console.log('Login successful for user:', user.username);
-
-      // Ensure session is saved to database before responding
-      req.session.save((err) => {
+      req.login(user, (err) => {
         if (err) {
-          console.error('Session save error:', err);
-          return res.status(500).json({ message: "Session error" });
+          return next(err);
         }
-        res.json({ user: userResponse });
+        
+        // Store client IP for session security middleware
+        req.session.clientIP = req.ip || (req.connection as any).remoteAddress || 'unknown';
+        
+        // Exclude password from response
+        const { password, ...userResponse } = user;
+        
+        console.log('Login successful for user:', user.username);
+        
+        return res.json({ user: userResponse });
       });
-    } catch (error: any) {
-      console.error('Login error:', error);
-      securityMonitor.logSecurityEvent({
-        type: 'login_attempt',
-        ip: clientIP,
-        userAgent,
-        details: { username: req.body.username, error: error?.message },
-        severity: 'medium',
-      });
-      res.status(500).json({ message: "Internal server error" });
-    }
+    })(req, res, next);
   });
 
 
   // Session validation route
   app.get("/api/auth/session", (req, res) => {
-    try {
-      if (!req.session?.userId || !req.session?.user) {
-        return res.status(401).json({ message: "No active session" });
-      }
-
-      res.json({
-        user: req.session.user,
-        isAuthenticated: true
-      });
-    } catch (error) {
-      console.error('Staff session check error:', error);
-      res.status(401).json({ message: "No active session" });
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ message: "No active session" });
     }
+    res.json({
+      user: req.user,
+      isAuthenticated: true
+    });
   });
 
   // Logout route
-  app.post("/api/auth/logout", (req, res) => {
-    req.session.destroy((err) => {
-      if (err) {
-        return res.status(500).json({ message: "Could not log out" });
-      }
+  app.post("/api/auth/logout", (req, res, next) => {
+    req.logout((err) => {
+      if (err) return next(err);
       res.json({ message: "Logged out successfully" });
     });
   });
@@ -587,8 +400,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Allow users to fetch their own settings, or admins/supervisors to fetch any user's settings
   app.get("/api/user-settings/:userId", requireAuth, async (req, res) => {
     try {
-      const currentUserId = req.session.userId!;
-      const userRole = req.session.user!.role;
+      const currentUserId = req.user!.id;
+      const userRole = req.user!.role;
       const requestedUserId = parseInt(req.params.userId);
 
       // Users can fetch their own settings, or admins/supervisors can fetch any user's settings
@@ -606,13 +419,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // User Settings Endpoints
   app.post("/api/user-settings", requireAuth, async (req, res) => {
     // The original code had req.isAuthenticated() and req.user, which are not standard Express.
-    // This has been replaced with checks for req.session.userId and req.session.user.role.
+    // This has been replaced with checks for req.user!.id and req.session.user.role.
 
     try {
       const { userId, settingKey, isEnabled } = req.body;
 
       // Only admin and supervisor users can modify user settings
-      if (req.session.user!.role !== 'admin' && req.session.user!.role !== 'supervisor') {
+      if (req.user!.role !== 'admin' && req.user!.role !== 'supervisor') {
         return res.status(403).json({ error: "Unauthorized" });
       }
 
@@ -630,7 +443,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.put("/api/user-settings", requireAuth, async (req, res) => {
     try {
-      const userRole = req.session.user!.role;
+      const userRole = req.user!.role;
 
       if (userRole !== "supervisor" && userRole !== "admin") {
         return res.status(403).json({ error: "Access denied. Supervisors and admin only." });
@@ -650,7 +463,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.delete("/api/user-settings/:userId/:settingKey", requireAuth, async (req, res) => {
     try {
-      const userRole = req.session.user!.role;
+      const userRole = req.user!.role;
 
       if (userRole !== "supervisor" && userRole !== "admin") {
         return res.status(403).json({ error: "Access denied. Supervisors and admin only." });
@@ -669,11 +482,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // Dashboard stats - User-specific (Optimized with caching)
+  // Dashboard stats - User-specific (Optimized with SQL aggregations)
   app.get("/api/dashboard/stats", requireAuth, async (req, res) => {
     try {
-      const currentUserId = req.session.userId!;
-      const userRole = req.session.user!.role;
+      const currentUserId = req.user!.id;
+      const userRole = req.user!.role;
       const cacheKey = `dashboard-stats-${userRole}-${currentUserId}`;
 
       // Check cache first (30 second TTL for dashboard data)
@@ -685,161 +498,51 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       console.log('Cache MISS for dashboard stats:', cacheKey);
 
-      // Make parallel database calls for better performance
-      const promises: Promise<any>[] = [];
-
-      if (userRole === "admin" || userRole === "supervisor") {
-        promises.push(
-          storage.getInvoices(),
-          storage.getAllExpenses(),
-          storage.getAllUsers(),
-          storage.getActiveLocations(),
-          storage.getAllDebts()
-        );
-      } else {
-        promises.push(
-          storage.getInvoicesByUser(currentUserId),
-          storage.getExpensesByUser(currentUserId),
-          storage.getUserLocation(currentUserId),
-          storage.getDebtsByUser(currentUserId)
-        );
-      }
-
-      const results = await Promise.all(promises);
-
       let totalRevenue = 0;
       let totalExpenses = 0;
       let jobsCompleted = 0;
-      let activeCleaners = 1;
+      let activeCleaners = 0;
       let workingNow = 0;
       let totalDebt = 0;
 
-      let totalEmployeeSalary = 0;
-      let totalMaterials = 0;
-      let totalTaxi = 0;
-
+      // Use SQL aggregations instead of loading all data into memory
       if (userRole === "admin" || userRole === "supervisor") {
-        const [invoices, expenses, users, activeLocations, debts] = results;
-
-        totalRevenue = invoices.reduce((sum: number, invoice: any) =>
-          sum + parseFloat(invoice.totalAmount), 0);
-
-        totalEmployeeSalary = invoices.reduce((sum: number, invoice: any) => {
-          const meta = invoice.metadata || {};
-          const salary = parseFloat(meta.dailySalary || meta.totalEmployeePay || "0");
-          return sum + (isNaN(salary) ? 0 : salary);
-        }, 0);
-
-        totalExpenses = expenses.reduce((sum: number, expense: any) =>
-          sum + parseFloat(expense.amount), 0);
-
-        invoices.forEach((invoice: any) => {
-          const meta = invoice.metadata || {};
-          
-          const materialsList = meta.materials || [];
-          let mSum = materialsList.reduce((acc: number, m: any) => {
-            const p = parseFloat(m.price);
-            return acc + (isNaN(p) ? 0 : p);
-          }, 0);
-          if (materialsList.length === 0 && meta.materialPrice) {
-            const sp = parseFloat(meta.materialPrice);
-            if (!isNaN(sp)) mSum += sp;
-          }
-          totalMaterials += mSum;
-
-          let taxi = 0;
-          let expensesArray: any[] = Array.isArray(invoice.expenses) ? invoice.expenses : [];
-          if (typeof invoice.expenses === 'string') {
-            try { expensesArray = JSON.parse(invoice.expenses); } catch(e) {}
-          }
-          const taxiExpense = expensesArray.find((e: any) => e.name?.toLowerCase().includes("taxi"));
-          if (taxiExpense) {
-            const tp = parseFloat(taxiExpense.price);
-            if (!isNaN(tp)) taxi += tp;
-          } else if (meta.taxiFare) {
-             const tp = parseFloat(meta.taxiFare);
-             if (!isNaN(tp)) taxi += tp;
-          }
-          totalTaxi += taxi;
-        });
-
-        jobsCompleted = invoices.filter((invoice: any) =>
-          invoice.status === "completed").length;
-
-        activeCleaners = users.filter((user: any) =>
-          user.role === "cleaner" && user.isActive).length;
-
-        workingNow = activeLocations.length;
-
-        totalDebt = debts
-          .filter((debt: any) => debt.status === "pending")
-          .reduce((sum: number, debt: any) => sum + parseFloat(debt.amount), 0);
+        // Admin/Supervisor: Get stats for ALL users
+        const invoiceStats = await storage.getDashboardInvoiceStats();
+        const expenseStats = await storage.getDashboardExpenseStats();
+        const debtStats = await storage.getDashboardDebtStats();
+        
+        totalRevenue = invoiceStats.totalRevenue;
+        jobsCompleted = invoiceStats.completedJobs;
+        totalExpenses = expenseStats.totalExpenses;
+        totalDebt = debtStats.totalDebt;
+        activeCleaners = await storage.getActiveCleanersCount();
+        workingNow = await storage.getActiveLocationsCount();
       } else {
-        const [invoices, expenses, userLocation, debts] = results;
-
-        totalRevenue = invoices.reduce((sum: number, invoice: any) =>
-          sum + parseFloat(invoice.totalAmount), 0);
-
-        totalEmployeeSalary = invoices.reduce((sum: number, invoice: any) => {
-          const meta = invoice.metadata || {};
-          const salary = parseFloat(meta.dailySalary || meta.totalEmployeePay || "0");
-          return sum + (isNaN(salary) ? 0 : salary);
-        }, 0);
-
-        totalExpenses = expenses.reduce((sum: number, expense: any) =>
-          sum + parseFloat(expense.amount), 0);
-
-        invoices.forEach((invoice: any) => {
-          const meta = invoice.metadata || {};
-          
-          const materialsList = meta.materials || [];
-          let mSum = materialsList.reduce((acc: number, m: any) => {
-            const p = parseFloat(m.price);
-            return acc + (isNaN(p) ? 0 : p);
-          }, 0);
-          if (materialsList.length === 0 && meta.materialPrice) {
-            const sp = parseFloat(meta.materialPrice);
-            if (!isNaN(sp)) mSum += sp;
-          }
-          totalMaterials += mSum;
-
-          let taxi = 0;
-          let expensesArray: any[] = Array.isArray(invoice.expenses) ? invoice.expenses : [];
-          if (typeof invoice.expenses === 'string') {
-            try { expensesArray = JSON.parse(invoice.expenses); } catch(e) {}
-          }
-          const taxiExpense = expensesArray.find((e: any) => e.name?.toLowerCase().includes("taxi"));
-          if (taxiExpense) {
-            const tp = parseFloat(taxiExpense.price);
-            if (!isNaN(tp)) taxi += tp;
-          } else if (meta.taxiFare) {
-             const tp = parseFloat(meta.taxiFare);
-             if (!isNaN(tp)) taxi += tp;
-          }
-          totalTaxi += taxi;
-        });
-
-        jobsCompleted = invoices.filter((invoice: any) =>
-          invoice.status === "completed").length;
-
+        // Regular user: Get stats for themselves only
+        const invoiceStats = await storage.getDashboardInvoiceStats(currentUserId);
+        const expenseStats = await storage.getDashboardExpenseStats(currentUserId);
+        const debtStats = await storage.getDashboardDebtStats(currentUserId);
+        
+        totalRevenue = invoiceStats.totalRevenue;
+        jobsCompleted = invoiceStats.completedJobs;
+        totalExpenses = expenseStats.totalExpenses;
+        totalDebt = debtStats.totalDebt;
+        
+        // For regular users, working status is personal
+        const userLocation = await storage.getUserLocation(currentUserId);
         workingNow = userLocation?.isWorking ? 1 : 0;
-
-        totalDebt = debts
-          .filter((debt: any) => debt.status === "pending")
-          .reduce((sum: number, debt: any) => sum + parseFloat(debt.amount), 0);
+        activeCleaners = 1; // Only self
       }
 
       const stats = {
         totalRevenue,
         totalExpenses,
         monthlyExpenses: totalExpenses,
-        totalMaterials,
-        totalTaxi,
         jobsCompleted,
         activeCleaners,
         workingNow,
         totalDebt,
-        totalEmployeeSalary,
         averageRating: 4.8
       };
 
@@ -853,11 +556,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // Daily performance data for dashboard charts (Optimized with caching)
+  // Daily performance data for dashboard charts (Optimized with SQL GROUP BY)
   app.get("/api/dashboard/daily-performance", requireAuth, async (req, res) => {
     try {
-      const currentUserId = req.session.userId!;
-      const userRole = req.session.user!.role;
+      const currentUserId = req.user!.id;
+      const userRole = req.user!.role;
       const cacheKey = `daily-performance-${userRole}-${currentUserId}`;
 
       // Check cache first (3 minute TTL for better performance)
@@ -869,52 +572,28 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       console.log('Cache MISS for daily performance:', cacheKey);
 
-      let invoices;
+      // Use SQL GROUP BY to get last 7 days performance
+      let performanceData;
 
-      // Get invoices based on user role
       if (userRole === "admin" || userRole === "supervisor") {
-        invoices = await storage.getInvoices();
+        // Admin/Supervisor: Get all users' performance
+        performanceData = await storage.getLast7DaysPerformance();
       } else {
-        invoices = await storage.getInvoicesByUser(currentUserId);
+        // Regular user: Get their own performance
+        performanceData = await storage.getLast7DaysPerformance(currentUserId);
       }
 
-      // Get last 7 days of data
-      const last7Days = [];
-      const today = new Date();
+      // Format for frontend (add width for chart bars)
+      const last7Days = performanceData.map((day: any) => ({
+        day: day.day,
+        date: day.date,
+        revenue: day.revenue,
+        jobs: day.jobs,
+        width: day.revenue > 0 ? `${Math.min(100, (day.revenue / 1500) * 100)}%` : '5%'
+      }));
 
-      for (let i = 6; i >= 0; i--) {
-        const date = new Date(today);
-        date.setDate(date.getDate() - i);
-        date.setHours(0, 0, 0, 0);
-
-        const nextDay = new Date(date);
-        nextDay.setDate(nextDay.getDate() + 1);
-
-        // Filter invoices for this day
-        const dayInvoices = invoices.filter(invoice => {
-          const invoiceDate = new Date(invoice.createdAt);
-          return invoiceDate >= date && invoiceDate < nextDay;
-        });
-
-        // Calculate daily stats
-        const dailyRevenue = dayInvoices.reduce((sum, invoice) =>
-          sum + parseFloat(invoice.totalAmount), 0);
-        const dailyJobs = dayInvoices.length;
-
-        // Get day name
-        const dayName = date.toLocaleDateString('en-US', { weekday: 'short' });
-
-        last7Days.push({
-          day: dayName,
-          date: date.toISOString().split('T')[0],
-          revenue: Math.round(dailyRevenue),
-          jobs: dailyJobs,
-          width: dailyRevenue > 0 ? `${Math.min(100, (dailyRevenue / 1500) * 100)}%` : '5%'
-        });
-      }
-
-      // Cache for 60 seconds
-      cache.set(cacheKey, last7Days, 60000);
+      // Cache for 3 minutes
+      cache.set(cacheKey, last7Days, 180000);
 
       res.json(last7Days);
     } catch (error) {
@@ -923,24 +602,28 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // Invoice routes - User-specific
+  // Invoice routes - User-specific with pagination
   app.get("/api/invoices", requireAuth, async (req, res) => {
     try {
-      const currentUserId = req.session.userId!;
-      const userRole = req.session.user!.role;
+      const currentUserId = req.user!.id;
+      const userRole = req.user!.role;
+      
+      // Get pagination parameters from query
+      const page = Math.max(1, parseInt(req.query.page as string) || 1);
+      const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 50));
 
-      let invoices;
+      let result;
 
       // Admin and supervisor can see all invoices, other users only see their own
       if (userRole === "admin" || userRole === "supervisor") {
-        invoices = await storage.getInvoices();
+        result = await storage.getInvoicesPaginated(page, limit);
       } else {
-        invoices = await storage.getInvoicesByUser(currentUserId);
+        result = await storage.getInvoicesPaginated(page, limit, currentUserId);
       }
 
-      // Join with user data
+      // Join with user data for paginated results
       const invoicesWithUsers = await Promise.all(
-        invoices.map(async (invoice) => {
+        result.items.map(async (invoice) => {
           const cleaner = await storage.getUser(invoice.cleanerId);
           return {
             ...invoice,
@@ -949,7 +632,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
         })
       );
 
-      res.json(invoicesWithUsers);
+      res.json({
+        items: invoicesWithUsers,
+        total: result.total,
+        page: result.page,
+        limit: result.limit,
+        pages: Math.ceil(result.total / result.limit)
+      });
     } catch (error) {
       res.status(500).json({ message: "Failed to fetch invoices" });
     }
@@ -957,7 +646,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.post("/api/invoices", requireAuth, async (req, res) => {
     try {
-      const currentUserId = req.session.userId!;
+      const currentUserId = req.user!.id;
       console.log("Invoices: Creating new invoice with data:", req.body);
 
       const validatedData = insertInvoiceSchema.parse({
@@ -993,8 +682,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.delete("/api/invoices/:id", requireAuth, async (req, res) => {
     try {
       const invoiceId = parseInt(req.params.id);
-      const currentUserId = req.session.userId!;
-      const userRole = req.session.user!.role;
+      const currentUserId = req.user!.id;
+      const userRole = req.user!.role;
 
       if (isNaN(invoiceId)) {
         return res.status(400).json({ message: "Invalid invoice ID" });
@@ -1028,7 +717,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Team routes - Only admin can see team (Optimized with caching)
   app.get("/api/team", requireAuth, async (req, res) => {
     try {
-      const userRole = req.session.user!.role;
+      const userRole = req.user!.role;
 
       // Only admin can view team members
       if (userRole !== "admin") {
@@ -1125,7 +814,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Location history route
   app.get("/api/locations/history", requireAuth, async (req, res) => {
     try {
-      const userRole = req.session.user!.role;
+      const userRole = req.user!.role;
       const { startDate, endDate, userId, search } = req.query;
 
       // Only supervisors and admin can view location history
@@ -1191,7 +880,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.get("/api/services/all", requireAuth, async (req, res) => {
     try {
-      const userRole = req.session.user!.role;
+      const userRole = req.user!.role;
 
       if (userRole !== "supervisor" && userRole !== "admin") {
         return res.status(403).json({ error: "Access denied. Supervisors and admin only." });
@@ -1215,7 +904,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.post("/api/services", requireAuth, async (req, res) => {
     try {
-      const userRole = req.session.user!.role;
+      const userRole = req.user!.role;
 
       // Only supervisors and admin can create services
       if (userRole !== "supervisor" && userRole !== "admin") {
@@ -1251,7 +940,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.put("/api/services/:id", requireAuth, async (req, res) => {
     try {
-      const userRole = req.session.user!.role;
+      const userRole = req.user!.role;
 
       // Only supervisors and admin can update services
       if (userRole !== "supervisor" && userRole !== "admin") {
@@ -1296,7 +985,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.delete("/api/services/:id", requireAuth, async (req, res) => {
     try {
-      const userRole = req.session.user!.role;
+      const userRole = req.user!.role;
 
       // Only supervisors and admin can delete services
       if (userRole !== "supervisor" && userRole !== "admin") {
@@ -1331,7 +1020,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Customer Bookings routes
   app.get("/api/customer/bookings", requireAuth, async (req, res) => {
     try {
-      const user = req.session.user!;
+      const user = req.user!;
       let bookingsList;
 
       if (user.role === "admin" || user.role === "supervisor") {
@@ -1403,7 +1092,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
             customerName: updatedBooking!.customerName,
             services: updatedBooking!.services,
             totalAmount: updatedBooking!.totalAmount,
-            cleanerId: updatedBooking!.assignedTo || req.session.userId!,
+            cleanerId: updatedBooking!.assignedTo || req.user!.id,
             status: "completed",
             notes: updatedBooking!.notes || "",
             createdAt: invoiceDate,
@@ -1483,19 +1172,29 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Expense management routes
   app.get("/api/expenses", requireAuth, async (req, res) => {
     try {
-      const currentUserId = req.session.userId!;
-      const userRole = req.session.user!.role;
+      const currentUserId = req.user!.id;
+      const userRole = req.user!.role;
 
-      let expenses;
+      // Get pagination parameters from query
+      const page = Math.max(1, parseInt(req.query.page as string) || 1);
+      const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 50));
+
+      let result;
 
       // Admin and supervisor can see all expenses, other users only see their own
       if (userRole === "admin" || userRole === "supervisor") {
-        expenses = await storage.getAllExpenses();
+        result = await storage.getExpensesPaginated(page, limit);
       } else {
-        expenses = await storage.getExpensesByUser(currentUserId);
+        result = await storage.getExpensesPaginated(page, limit, currentUserId);
       }
 
-      res.json(expenses);
+      res.json({
+        items: result.items,
+        total: result.total,
+        page: result.page,
+        limit: result.limit,
+        pages: Math.ceil(result.total / result.limit)
+      });
     } catch (error) {
       res.status(500).json({ message: "Failed to fetch expenses" });
     }
@@ -1503,7 +1202,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.post("/api/expenses", requireAuth, async (req, res) => {
     try {
-      const currentUserId = req.session.userId!;
+      const currentUserId = req.user!.id;
       const expenseData = {
         ...req.body,
         userId: currentUserId,
@@ -1525,8 +1224,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.put("/api/expenses/:id", requireAuth, async (req, res) => {
     try {
-      const currentUserId = req.session.userId!;
-      const userRole = req.session.user!.role;
+      const currentUserId = req.user!.id;
+      const userRole = req.user!.role;
       const expenseId = parseInt(req.params.id);
 
       // Check if user owns the expense or is supervisor/admin
@@ -1556,8 +1255,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.delete("/api/expenses/:id", requireAuth, async (req, res) => {
     try {
-      const currentUserId = req.session.userId!;
-      const userRole = req.session.user!.role;
+      const currentUserId = req.user!.id;
+      const userRole = req.user!.role;
       const expenseId = parseInt(req.params.id);
 
       // Check if user owns the expense or is supervisor/admin
@@ -1679,7 +1378,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.put("/api/settings/:key", requireAuth, async (req, res) => {
     try {
-      const userRole = req.session.user!.role;
+      const userRole = req.user!.role;
 
       if (userRole !== "supervisor" && userRole !== "admin") {
         return res.status(403).json({ error: "Access denied. Supervisors and admin only." });
@@ -1701,7 +1400,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.post("/api/settings", requireAuth, async (req, res) => {
     try {
-      const userRole = req.session.user!.role;
+      const userRole = req.user!.role;
 
       if (userRole !== "supervisor" && userRole !== "admin") {
         return res.status(403).json({ error: "Access denied. Supervisors and admin only." });
@@ -2249,7 +1948,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Notification routes
   app.get("/api/notifications", requireAuth, async (req, res) => {
     try {
-      const userId = req.session.userId!;
+      const userId = req.user!.id;
       const notifications = await storage.getNotificationsByUser(userId);
       res.json(notifications);
     } catch (error) {
@@ -2259,7 +1958,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.get("/api/notifications/unread", requireAuth, async (req, res) => {
     try {
-      const userId = req.session.userId!;
+      const userId = req.user!.id;
       const notifications = await storage.getUnreadNotificationsByUser(userId);
       res.json(notifications);
     } catch (error) {
@@ -2270,7 +1969,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.patch("/api/notifications/:id/read", requireAuth, async (req, res) => {
     try {
       const notificationId = parseInt(req.params.id);
-      const userId = req.session.userId!;
+      const userId = req.user!.id;
       await storage.markNotificationAsRead(notificationId, userId);
       res.json({ message: 'Notification marked as read' });
     } catch (error) {
@@ -2280,7 +1979,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.patch("/api/notifications/read-all", requireAuth, async (req, res) => {
     try {
-      const userId = req.session.userId!;
+      const userId = req.user!.id;
       await storage.markAllNotificationsAsRead(userId);
       res.json({ message: 'All notifications marked as read' });
     } catch (error) {
@@ -2291,7 +1990,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.delete("/api/notifications/:id", requireAuth, async (req, res) => {
     try {
       const notificationId = parseInt(req.params.id);
-      const userId = req.session.userId!;
+      const userId = req.user!.id;
       await storage.deleteNotification(notificationId, userId);
       res.json({ message: 'Notification deleted successfully' });
     } catch (error) {
@@ -2755,24 +2454,29 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Debt management routes
   app.get("/api/debts", requireAuth, async (req, res) => {
     try {
-      const currentUserId = req.session.userId!;
-      const userRole = req.session.user!.role;
+      const currentUserId = req.user!.id;
+      const userRole = req.user!.role;
 
-      let debts: any[] = [];
+      // Get pagination parameters from query
+      const page = Math.max(1, parseInt(req.query.page as string) || 1);
+      const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 50));
+
+      let result;
 
       // Admin and supervisor can see all debts, other users only see their own
       if (userRole === "admin" || userRole === "supervisor") {
-        debts = await storage.getAllDebts();
+        result = await storage.getDebtsPaginated(page, limit);
       } else {
-        debts = await storage.getDebtsByUser(currentUserId);
+        result = await storage.getDebtsPaginated(page, limit, currentUserId);
       }
 
-      // Ensure debts is always an array
-      if (!Array.isArray(debts)) {
-        debts = [];
-      }
-
-      res.json(debts);
+      res.json({
+        items: result.items,
+        total: result.total,
+        page: result.page,
+        limit: result.limit,
+        pages: Math.ceil(result.total / result.limit)
+      });
     } catch (error: any) {
       console.error('Error fetching debts:', error);
       res.status(500).json({ error: "Failed to fetch debts", message: error?.message });
@@ -2781,7 +2485,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.post("/api/debts", requireAuth, async (req, res) => {
     try {
-      const currentUserId = req.session.userId!;
+      const currentUserId = req.user!.id;
       const debtData = {
         ...req.body,
         userId: currentUserId,
@@ -2805,8 +2509,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Support both PUT and PATCH for updates
   const updateDebtHandler = async (req: Request, res: Response) => {
     try {
-      const currentUserId = req.session.userId!;
-      const userRole = req.session.user!.role;
+      const currentUserId = req.user!.id;
+      const userRole = req.user!.role;
       const debtId = parseInt(req.params.id);
 
       // Check if user owns the debt or is supervisor/admin
@@ -2848,8 +2552,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.post("/api/debts/:id/payments", requireAuth, async (req, res) => {
     try {
       const debtId = parseInt(req.params.id);
-      const userId = req.session.userId!;
-      const userRole = req.session.user!.role;
+      const userId = req.user!.id;
+      const userRole = req.user!.role;
 
       // First verify the debt belongs to the user or is accessible by admin/supervisor
       const debt = await storage.getDebt(debtId);
@@ -2889,7 +2593,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.get("/api/debts/:id/payments", requireAuth, async (req, res) => {
     try {
       const debtId = parseInt(req.params.id);
-      const userId = req.session.userId!; // Ensure userId is available
+      const userId = req.user!.id; // Ensure userId is available
 
       // First verify the debt belongs to the user or is accessible by admin/supervisor
       const debt = await storage.getDebt(debtId);
@@ -2897,7 +2601,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(404).json({ error: "Debt not found" });
       }
 
-      const userRole = req.session.user!.role;
+      const userRole = req.user!.role;
       if (debt.userId !== userId && userRole !== "admin" && userRole !== "supervisor") {
         return res.status(403).json({ error: "Access denied" });
       }
@@ -2914,8 +2618,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Get all payment history records
   app.get("/api/payment-history", requireAuth, async (req, res) => {
     try {
-      const userId = req.session.userId!;
-      const userRole = req.session.user!.role;
+      const userId = req.user!.id;
+      const userRole = req.user!.role;
 
       // Admin and supervisor can see all payment history, others see only their own
       let payments;
@@ -2935,8 +2639,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.delete("/api/debts/:id", requireAuth, async (req, res) => {
     try {
       const debtId = parseInt(req.params.id);
-      const userId = req.session.userId!;
-      const userRole = req.session.user!.role;
+      const userId = req.user!.id;
+      const userRole = req.user!.role;
 
       // Check if user owns the debt or is supervisor/admin
       const debt = await storage.getDebt(debtId);
